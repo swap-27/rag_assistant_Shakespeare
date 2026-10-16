@@ -1,0 +1,6 @@
+sentence-transformers
+faiss-cpu
+numpy
+python-dotenv
+pypdf
+langchain
