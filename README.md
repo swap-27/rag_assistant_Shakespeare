@@ -1,0 +1,1 @@
+RAG Assistant to search and reply any query about Shakespeare's works.
