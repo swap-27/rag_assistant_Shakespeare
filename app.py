@@ -1,65 +1,49 @@
 
-import json
-import os
 import pickle
 from pathlib import Path
 
 import faiss
-from dotenv import load_dotenv
-from langchain_huggingface.chat_models import ChatHuggingFace
+import ollama
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-load_dotenv()
+
+# Configuration
+BASE_DIR = Path(__file__).resolve().parent
+PDF_FOLDER = BASE_DIR / "Shakespeare_document"
+ARTIFACTS_FOLDER = BASE_DIR / "artifacts"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE, CHUNK_OVERLAP, TOP_K = 1000, 150, 5
+LLM_MODEL = "phi3:latest"
+
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+TOP_K = 5
 MIN_SIMILARITY = 0.25
 
-INDEX_FILE = "faiss.index"
-METADATA_FILE = "metadata.pkl"
-MANIFEST_FILE = "manifest.json"
+INDEX_PATH = ARTIFACTS_FOLDER / "faiss.index"
+METADATA_PATH = ARTIFACTS_FOLDER / "metadata.pkl"
 
 
-def get_pdf_files(folder):
-    """Find all PDFs recursively, excluding macOS metadata folders."""
-    return sorted(
-        p for p in Path(folder).rglob("*.pdf")
-        if "__MACOSX" not in p.parts
-    )
-
-
-def get_manifest(pdf_files, folder):
-    """Detect added, removed, or modified PDFs."""
-    return [
-        {
-            "path": str(p.relative_to(folder)),
-            "size": p.stat().st_size,
-            "modified": p.stat().st_mtime_ns,
-        }
-        for p in pdf_files
-    ]
-
-
-def extract_pdf(path, source):
-    """Extract page text while preserving source filename and page number."""
+def extract_pdf(pdf_path):
+    """Extract text from every PDF page with source metadata."""
     pages = []
 
-    for number, page in enumerate(PdfReader(path).pages, start=1):
+    for page_number, page in enumerate(PdfReader(pdf_path).pages, start=1):
         text = page.extract_text() or ""
 
         if text.strip():
             pages.append({
                 "text": " ".join(text.split()),
-                "source": source,
-                "page": number,
+                "source": pdf_path.name,
+                "page": page_number,
             })
 
     return pages
 
 
 def chunk_pages(pages):
-    """Split pages into overlapping chunks and preserve metadata."""
+    """Split page text into overlapping chunks."""
     chunks = []
 
     for page in pages:
@@ -84,9 +68,9 @@ def chunk_pages(pages):
 
 
 def build_index(chunks, model):
-    """Embed all chunks and build an exact FAISS similarity index."""
+    """Create a FAISS index from normalized text embeddings."""
     vectors = model.encode(
-        [c["text"] for c in chunks],
+        [chunk["text"] for chunk in chunks],
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=True,
@@ -98,74 +82,64 @@ def build_index(chunks, model):
     return index
 
 
-def load_or_build_index(folder, model):
-    """Load the cached index or rebuild it when PDFs change."""
-    folder = Path(folder).resolve()
-    pdf_files = get_pdf_files(folder)
+def load_or_build_index(model):
+    """Load existing artifacts or ask to create them."""
+    ARTIFACTS_FOLDER.mkdir(parents=True, exist_ok=True)
+
+    if INDEX_PATH.exists() and METADATA_PATH.exists():
+        index = faiss.read_index(str(INDEX_PATH))
+
+        with open(METADATA_PATH, "rb") as file:
+            chunks = pickle.load(file)
+
+        if index.ntotal == len(chunks) and index.ntotal > 0:
+            print(f"Loaded existing index: {index.ntotal} chunks")
+            return chunks, index
+
+        print("The index and metadata do not match.")
+
+    choice = input(
+        "FAISS index or metadata missing/invalid. "
+        "Create the index now? (y/n): "
+    ).strip().lower()
+
+    if choice not in {"y", "yes"}:
+        raise SystemExit("Index creation cancelled.")
+
+    if not PDF_FOLDER.is_dir():
+        raise SystemExit(f"PDF folder not found: {PDF_FOLDER}")
+
+    pdf_files = sorted(PDF_FOLDER.rglob("*.pdf"))
 
     if not pdf_files:
-        raise SystemExit(f"No PDFs found in: {folder}")
+        raise SystemExit(f"No PDF files found in: {PDF_FOLDER}")
 
-    manifest = get_manifest(pdf_files, folder)
-
-    index_path = folder / INDEX_FILE
-    metadata_path = folder / METADATA_FILE
-    manifest_path = folder / MANIFEST_FILE
-
-    # Reuse the index if the PDF collection has not changed.
-    if all(p.exists() for p in (
-        index_path, metadata_path, manifest_path
-    )):
-        with open(manifest_path, encoding="utf-8") as f:
-            saved_manifest = json.load(f)
-
-        if saved_manifest == manifest:
-            index = faiss.read_index(str(index_path))
-
-            with open(metadata_path, "rb") as f:
-                chunks = pickle.load(f)
-
-            if index.ntotal == len(chunks) and index.ntotal > 0:
-                print(f"Loaded cached index: {index.ntotal} chunks")
-                return chunks, index
-
-    # Rebuild if any PDF was added, removed, or modified.
-    print(f"Indexing {len(pdf_files)} PDF documents...")
     chunks = []
 
-    for i, pdf in enumerate(pdf_files, start=1):
-        source = str(pdf.relative_to(folder))
-        print(f"[{i}/{len(pdf_files)}] Reading {source}")
-
-        pages = extract_pdf(pdf, source)
-        chunks.extend(chunk_pages(pages))
+    for number, pdf_path in enumerate(pdf_files, start=1):
+        print(f"Reading PDF {number}/{len(pdf_files)}: {pdf_path.name}")
+        chunks.extend(chunk_pages(extract_pdf(pdf_path)))
 
     if not chunks:
-        raise SystemExit(
-            "No extractable text found. Scanned PDFs may require OCR."
-        )
+        raise SystemExit("No extractable PDF text found.")
 
     print(f"Created {len(chunks)} chunks.")
-    print("Generating embeddings and building FAISS index...")
+    print("Building FAISS index...")
 
     index = build_index(chunks, model)
 
-    # Save index and metadata for future runs.
-    faiss.write_index(index, str(index_path))
+    faiss.write_index(index, str(INDEX_PATH))
 
-    with open(metadata_path, "wb") as f:
-        pickle.dump(chunks, f)
+    with open(METADATA_PATH, "wb") as file:
+        pickle.dump(chunks, file)
 
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-    print(f"Saved index and metadata in {folder}")
+    print(f"Index and metadata saved in: {ARTIFACTS_FOLDER}")
 
     return chunks, index
 
 
 def retrieve(question, chunks, index, model):
-    """Retrieve the top-k chunks and their source metadata."""
+    """Retrieve the most relevant chunks for a question."""
     vector = model.encode(
         [question],
         convert_to_numpy=True,
@@ -178,87 +152,56 @@ def retrieve(question, chunks, index, model):
 
     for score, idx in zip(scores[0], ids[0]):
         if idx >= 0:
-            item = dict(chunks[int(idx)])
-            item["score"] = float(score)
-            results.append(item)
+            result = dict(chunks[int(idx)])
+            result["score"] = float(score)
+            results.append(result)
 
     return results
 
 
-def answer_question(question, passages, llm):
-    """Generate an answer using only the retrieved evidence."""
+def answer_question(question, passages):
+    """Generate an evidence-based answer using local Ollama."""
     if not passages or max(p["score"] for p in passages) < MIN_SIMILARITY:
-        return (
-            "The provided documents do not contain enough relevant "
-            "evidence to answer this question."
-        )
+        return "The documents do not contain enough relevant evidence to answer."
 
     context = "\n\n".join(
-        f"[{i}] Source: {p['source']}, PDF page {p['page']}\n"
-        f"{p['text']}"
+        f"[{i}] Source: {p['source']}, PDF page {p['page']}\n{p['text']}"
         for i, p in enumerate(passages, start=1)
     )
-    for i, p in enumerate(passages, start=1):
-        print("="*80)
-        print(f"Source identified:{p['source']}")
-        print(f"PDF page: {p['page']}")
-        print(f"Chunk: {p['text']}")
 
-    prompt = f"""You are a careful research assistant.
-
-Answer using ONLY the supplied passages.
-Do not use outside knowledge or invent facts.
-If evidence is insufficient, explicitly say so.
-Cite factual claims using passage numbers such as [1] and [2].
-If sources conflict, explain the conflict.
+    prompt = f"""Answer using ONLY the passages below.
+Do not invent facts or use outside knowledge.
+Cite factual claims using passage numbers, such as [1].
+If the evidence is insufficient, say so.
 
 PASSAGES:
 {context}
 
 QUESTION: {question}
 
-Answer:"""
+ANSWER:"""
 
-    '''response = llm.invoke(prompt)
-    return response.content'''
-    return
+    response = ollama.chat(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "temperature": 0.2,
+            "num_ctx": 2048,
+            "num_predict": 128,
+        },
+    )
+
+    return response["message"]["content"]
 
 
 def main():
-
-    folder = Path(__file__).resolve().parent / "Shakespeare_document"
-
-    if not folder.is_dir():
-        raise SystemExit(f"Folder not found: {folder}")
-
-    hf_token = (
-        os.getenv("HF_TOKEN")
-        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-        or os.getenv("API_KEY")
-    )
-
-    if not hf_token:
-        raise SystemExit(
-            "Set HF_TOKEN in your .env file to access Hugging Face."
-        )
-
-    print(f"Loading embedding model: {EMBEDDING_MODEL}")
+    #print(f"Loading embedding model: {EMBEDDING_MODEL}")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
-    chunks, index = load_or_build_index(folder, embedding_model)
+    chunks, index = load_or_build_index(embedding_model)
 
-    print("Connecting to the Hugging Face inference endpoint...")
-    llm = ChatHuggingFace.from_model_id(
-        model_id="meta-llama/Llama-3.1-8B-Instruct",
-        task="text-generation",
-        backend="endpoint",
-        huggingfacehub_api_token=hf_token,
-        temperature=0.2,
-        max_new_tokens=256,
-    )
-
-    print(f"\nReady. Indexed {len(chunks)} chunks.")
-    print("Ask a question, or type 'exit' to quit.\n")
+    #print(f"\nRAG is ready. Indexed {len(chunks)} chunks.")
+    #print("Ask a question, or type 'exit' to quit.\n")
 
     while True:
         try:
@@ -274,23 +217,19 @@ def main():
         if not question:
             continue
 
-        passages = retrieve(
-            question, chunks, index, embedding_model
-        )
-        answer = answer_question(question, passages, llm)
+        passages = retrieve(question, chunks, index, embedding_model)
+        answer = answer_question(question, passages)
 
         print("\nAnswer\n------")
         print(answer)
 
-        print("\nRetrieved sources\n-----------------")
-        for i, p in enumerate(passages, start=1):
+        '''print("\nSources")
+        for i, passage in enumerate(passages, start=1):
             print(
-                f"[{i}] {p['source']} | PDF page {p['page']} "
-                f"| similarity {p['score']:.3f}"
-            )
-            print(p["text"], "\n")
-
-        print("=" * 72)
+                f"[{i}] {passage['source']}, "
+                f"page {passage['page']}, "
+                f"similarity: {passage['score']:.3f}"
+            )'''
 
 
 if __name__ == "__main__":

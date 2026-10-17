@@ -4,3 +4,4 @@ numpy
 python-dotenv
 pypdf
 langchain
+ollama==0.35.0
